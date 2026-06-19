@@ -92,6 +92,10 @@
   .photo-btn{width:100%;padding:16px;border:1.5px dashed var(--line);border-radius:11px;
     background:var(--paper);color:var(--muted);font-weight:600}
   .photo-btn.set{border-style:solid;border-color:var(--accent);color:var(--accent-ink);background:#EAF3F0}
+  .rcpt-btns{display:flex;gap:10px}
+  .photo-btn.half{flex:1;padding:15px 8px;font-size:.92rem}
+  .rcpt-status{margin-top:10px;font-size:.85rem;color:var(--accent-ink);
+    background:#EAF3F0;border-radius:9px;padding:9px 11px;font-weight:600}
   .photo-prev{margin-top:10px;border-radius:10px;max-height:200px;width:100%;object-fit:contain;
     background:#F0EEE8;display:none}
   .sheetbtns{display:flex;gap:10px;margin-top:6px}
@@ -214,6 +218,140 @@ function processImage(file){
 }
 const blobToDataURL=b=>new Promise(r=>{const fr=new FileReader();fr.onload=()=>r(fr.result);fr.readAsDataURL(b);});
 
+/* ---------- receipt reading (PDF + OCR + parse) ---------- */
+const _loaded={};
+function ensureScript(src){
+  if(_loaded[src])return _loaded[src];
+  _loaded[src]=new Promise((res,rej)=>{
+    const s=document.createElement("script");s.src=src;
+    s.onload=()=>res();s.onerror=()=>rej(new Error("load failed: "+src));
+    document.head.appendChild(s);
+  });
+  return _loaded[src];
+}
+const PDFJS_SRC="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js";
+const PDFJS_WORKER="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+const TESS_SRC="https://cdnjs.cloudflare.com/ajax/libs/tesseract.js/5.1.1/tesseract.min.js";
+
+async function ensurePdfjs(){
+  await ensureScript(PDFJS_SRC);
+  window.pdfjsLib.GlobalWorkerOptions.workerSrc=PDFJS_WORKER;
+  return window.pdfjsLib;
+}
+async function ensureTesseract(){await ensureScript(TESS_SRC);return window.Tesseract;}
+
+const canvasToBlob=(c,q=0.82)=>new Promise(r=>c.toBlob(b=>r(b),"image/jpeg",q));
+
+/* render a PDF (up to 5 pages) to JPEG blobs; first page kept large for OCR */
+async function pdfToImages(file){
+  const lib=await ensurePdfjs();
+  const buf=await file.arrayBuffer();
+  const pdf=await lib.getDocument({data:buf}).promise;
+  const out=[];let firstDataURL=null;
+  const n=Math.min(pdf.numPages,5);
+  for(let i=1;i<=n;i++){
+    const page=await pdf.getPage(i);
+    let vp=page.getViewport({scale:1});
+    const target=i===1?2000:1500;                 // bigger first page = better OCR
+    const scale=Math.min(target/Math.max(vp.width,vp.height),3);
+    vp=page.getViewport({scale});
+    const c=document.createElement("canvas");c.width=vp.width;c.height=vp.height;
+    const ctx=c.getContext("2d");ctx.fillStyle="#fff";ctx.fillRect(0,0,c.width,c.height);
+    await page.render({canvasContext:ctx,viewport:vp}).promise;
+    if(i===1)firstDataURL=c.toDataURL("image/jpeg",0.9);
+    out.push(await canvasToBlob(c,i===1?0.85:0.8));
+  }
+  return {images:out,ocrSource:firstDataURL};
+}
+
+/* downscale an image file to a JPEG blob, and return a dataURL for OCR */
+async function imageToReceipt(file){
+  const blob=await processImage(file);
+  const dataURL=await blobToDataURL(blob);
+  return {images:[blob],ocrSource:dataURL};
+}
+
+async function ocrText(dataURL,onProgress){
+  const T=await ensureTesseract();
+  const res=await T.recognize(dataURL,"eng",{
+    logger:m=>{if(m.status==="recognizing text"&&onProgress)onProgress(m.progress);}
+  });
+  return res.data.text||"";
+}
+
+/* heuristics: pull merchant / amount / date / category from OCR text */
+function parseReceiptText(text){
+  const lines=text.split(/\r?\n/).map(l=>l.trim()).filter(Boolean);
+  const low=text.toLowerCase();
+  const out={merchant:null,amount:null,date:null,category:null};
+
+  // amount: prefer numbers on total-like lines, else the largest 2-decimal number
+  const numRe=/(\d{1,3}(?:,\d{3})*|\d+)\.(\d{2})\b/g;
+  const cand=[];
+  lines.forEach(l=>{
+    const ll=l.toLowerCase();
+    const weight=/(grand\s*total|amount\s*due|balance\s*due|total\s*due|^total\b|\btotal\b|amount\s*paid|charged)/.test(ll)
+      ?(/(grand\s*total|amount\s*due|balance\s*due|total\s*due)/.test(ll)?3:2):1;
+    if(/subtotal|sub\s*total|tax|tip|gratuity|change|cash|qty|item/.test(ll)&&weight<2)return;
+    let m;numRe.lastIndex=0;
+    while((m=numRe.exec(l))){const v=parseFloat(m[0].replace(/,/g,""));if(v>0&&v<100000)cand.push({v,weight});}
+  });
+  if(cand.length){
+    const maxW=Math.max(...cand.map(c=>c.weight));
+    const pool=cand.filter(c=>c.weight===maxW);
+    out.amount=Math.max(...pool.map(c=>c.v));
+  }
+
+  // date
+  const months={jan:1,feb:2,mar:3,apr:4,may:5,jun:6,jul:7,aug:8,sep:9,oct:10,nov:11,dec:12};
+  const iso=v=>{const d=String(v.d).padStart(2,"0"),mo=String(v.m).padStart(2,"0");return `${v.y}-${mo}-${d}`;};
+  let dm;
+  if((dm=text.match(/\b(20\d{2})[\/\-.](\d{1,2})[\/\-.](\d{1,2})\b/))){
+    out.date=iso({y:+dm[1],m:+dm[2],d:+dm[3]});
+  }else if((dm=text.match(/\b(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})\b/))){
+    let y=+dm[3];if(y<100)y+=2000;let mo=+dm[1],d=+dm[2];if(mo>12&&d<=12){[mo,d]=[d,mo];}
+    if(mo>=1&&mo<=12&&d>=1&&d<=31)out.date=iso({y,m:mo,d});
+  }else if((dm=text.match(/\b([A-Za-z]{3,9})\.?\s+(\d{1,2}),?\s+(20\d{2})\b/))){
+    const mo=months[dm[1].slice(0,3).toLowerCase()];if(mo)out.date=iso({y:+dm[3],m:mo,d:+dm[2]});
+  }
+
+  // merchant: first "name-like" line near the top
+  for(const l of lines.slice(0,6)){
+    const letters=(l.match(/[A-Za-z]/g)||[]).length;
+    if(letters>=3 && !/^\d/.test(l) && !/(receipt|invoice|order|tax|tel|phone|www\.|http|@|\d{3}[-.\s]\d{3})/i.test(l)
+       && l.length<=40){ out.merchant=l.replace(/\s{2,}/g," ").trim(); break; }
+  }
+
+  // category guess from keywords (only if it matches an existing category)
+  const map=[
+    [/hotel|inn|suites|lodg|marriott|hilton|hyatt|airbnb|resort/,"Lodging"],
+    [/uber|lyft|taxi|cab|parking|toll|transit|metro|rail|train|rental|hertz|avis|enterprise|gas|fuel|shell|exxon/,"Ground Transport"],
+    [/air|airline|airways|united|delta|american|jetblue|southwest|flight|baggage/,"Airfare"],
+    [/restaurant|cafe|coffee|grill|kitchen|bar|bistro|diner|pizza|sushi|starbucks|dunkin|food|deli/,"Meals"],
+    [/conference|registration|summit|expo|symposium|workshop|admission/,"Conference / Registration"],
+    [/office|staples|supply|supplies|amazon|fedex|ups|print|hardware/,"Supplies"]
+  ];
+  for(const [re,cat] of map){
+    if(re.test(low)&&settings.categories.includes(cat)){out.category=cat;break;}
+  }
+  return out;
+}
+
+/* full pipeline: file -> {images, fields} */
+async function extractReceipt(file,onProgress){
+  const isPdf=file.type==="application/pdf"||/\.pdf$/i.test(file.name);
+  const {images,ocrSource}= isPdf ? await pdfToImages(file) : await imageToReceipt(file);
+  let fields={};
+  if(ocrSource){
+    try{ fields=parseReceiptText(await ocrText(ocrSource,onProgress)); }
+    catch(e){ console.warn("OCR failed",e); }
+  }
+  return {images,fields};
+}
+
+/* normalize legacy records (single imageBlob -> images[]) */
+function normalize(e){if(e&&!Array.isArray(e.images))e.images=e.imageBlob?[e.imageBlob]:[];return e;}
+
 /* ---------- state + routing ---------- */
 let view="folders", currentFolderId=null;
 const $=id=>document.getElementById(id);
@@ -271,7 +409,7 @@ async function renderFolder(){
   $("title").textContent=folder.name;
   $("fab").style.display="none";
 
-  const exps=(await getByFolder(currentFolderId))
+  const exps=(await getByFolder(currentFolderId)).map(normalize)
     .sort((a,b)=>(a.date||"").localeCompare(b.date||"")||a.createdAt-b.createdAt);
   const sum=exps.reduce((a,e)=>a+Number(e.amount||0),0);
   $("subtitle").textContent=exps.length?`${exps.length} item${exps.length!==1?"s":""}`:"Empty — add your first receipt";
@@ -286,7 +424,7 @@ async function renderFolder(){
   if(!exps.length){
     main.innerHTML=`<div class="empty"><div class="big">🧾</div>
       <p><strong>No receipts in this folder.</strong></p>
-      <p>Tap “Add expense” below, snap the receipt, and it’s logged.</p></div>`;
+      <p>Tap “Add expense” below, then snap or upload the receipt — it auto-fills the fields.</p></div>`;
     return;
   }
   main.innerHTML=exps.map(e=>`
@@ -296,7 +434,7 @@ async function renderFolder(){
       <div class="meta">
         <span class="chip">${escapeHtml(e.category||"Uncategorized")}</span>
         <span>${fmtDate(e.date)}</span>
-        ${e.imageBlob?'<span class="has-photo">🧾 receipt</span>':'<span>no photo</span>'}
+        ${e.images&&e.images.length?`<span class="has-photo">🧾 ${e.images.length>1?e.images.length+" pages":"receipt"}</span>`:'<span>no receipt</span>'}
       </div>
     </div>`).join("")+
     `<div class="swipe-hint">Tap any item to edit or delete it.</div>`;
@@ -334,9 +472,9 @@ function openFolderSheet(){
 }
 
 /* add / edit expense */
-let pendingBlob=null;
+let pendingImages=null;
 function openExpenseSheet(exp){
-  pendingBlob=null;
+  pendingImages=null;
   const editing=!!exp;
   const cats=settings.categories;
   const curCat=exp?exp.category:cats[0];
@@ -351,9 +489,14 @@ function openExpenseSheet(exp){
       <select id="eCat">${cats.map(c=>`<option ${c===curCat?"selected":""}>${escapeHtml(c)}</option>`).join("")}</select></div>
     <div class="field"><label>Note (optional)</label>
       <input id="eNote" placeholder="Client, purpose…" autocomplete="off" value="${editing&&exp.note?escapeHtml(exp.note):""}"></div>
-    <div class="field"><label>Receipt photo</label>
-      <button class="photo-btn ${editing&&exp.imageBlob?"set":""}" id="photoBtn">${editing&&exp.imageBlob?"✓ Receipt attached — tap to replace":"📷 Take photo / choose receipt"}</button>
-      <input id="photoInput" type="file" accept="image/*" capture="environment" style="display:none">
+    <div class="field"><label>Receipt — auto-fills the fields above</label>
+      <div class="rcpt-btns">
+        <button class="photo-btn half" id="camBtn">📷 Take photo</button>
+        <button class="photo-btn half" id="fileBtn">📄 Upload PDF / image</button>
+      </div>
+      <input id="camInput" type="file" accept="image/*" capture="environment" style="display:none">
+      <input id="fileInput" type="file" accept="image/*,application/pdf" style="display:none">
+      <div class="rcpt-status" id="rcptStatus" style="display:none"></div>
       <img class="photo-prev" id="photoPrev">
     </div>
     <div class="sheetbtns">
@@ -361,23 +504,46 @@ function openExpenseSheet(exp){
       <button class="btn btn-primary" id="save">${editing?"Save changes":"Add expense"}</button>
     </div>`);
 
-  // show existing image
-  if(editing&&exp.imageBlob){
-    const u=URL.createObjectURL(exp.imageBlob);
-    const p=$("photoPrev");p.src=u;p.style.display="block";
+  // show existing image(s)
+  normalize(exp||{});
+  if(editing&&exp.images&&exp.images.length){
+    const p=$("photoPrev");p.src=URL.createObjectURL(exp.images[0]);p.style.display="block";
+    if(exp.images.length>1){$("rcptStatus").style.display="block";$("rcptStatus").textContent=`${exp.images.length} pages attached`;}
   }
-  $("photoBtn").onclick=()=>$("photoInput").click();
-  $("photoInput").onchange=async ev=>{
-    const f=ev.target.files[0];if(!f)return;
+  // track manual edits so auto-fill never clobbers what you typed
+  ["eMerch","eAmt","eDate","eCat"].forEach(id=>$(id).addEventListener("input",e=>e.target.dataset.touched="1"));
+  const setIfUntouched=(id,val)=>{const el=$(id);if(val!=null&&!el.dataset.touched)el.value=val;};
+
+  async function handleReceipt(file){
+    if(!file)return;
+    const status=$("rcptStatus");status.style.display="block";
+    status.textContent="Reading receipt…";
     try{
-      toast("Processing photo…");
-      pendingBlob=await processImage(f);
-      const u=URL.createObjectURL(pendingBlob);
-      const p=$("photoPrev");p.src=u;p.style.display="block";
-      $("photoBtn").classList.add("set");
-      $("photoBtn").textContent="✓ New receipt ready — tap to replace";
-    }catch(e){toast("Couldn’t read that image");}
-  };
+      const {images,fields}=await extractReceipt(file,p=>{
+        status.textContent=`Reading receipt… ${Math.round(p*100)}%`;
+      });
+      pendingImages=images;
+      const p=$("photoPrev");p.src=URL.createObjectURL(images[0]);p.style.display="block";
+      // auto-fill
+      setIfUntouched("eMerch",fields.merchant);
+      if(fields.amount!=null)setIfUntouched("eAmt",fields.amount.toFixed(2));
+      setIfUntouched("eDate",fields.date);
+      if(fields.category)setIfUntouched("eCat",fields.category);
+      const got=[fields.merchant&&"merchant",fields.amount!=null&&"amount",fields.date&&"date"].filter(Boolean);
+      const pages=images.length>1?` · ${images.length} pages`:"";
+      status.innerHTML=got.length
+        ? `✓ Filled ${got.join(", ")}${pages} — check it’s right`
+        : `Receipt attached${pages} — couldn’t auto-read, enter manually`;
+      $("camBtn").classList.add("set");$("fileBtn").classList.add("set");
+    }catch(e){
+      console.error(e);
+      status.textContent="Couldn’t read that file — attach again or enter manually";
+    }
+  }
+  $("camBtn").onclick=()=>$("camInput").click();
+  $("fileBtn").onclick=()=>$("fileInput").click();
+  $("camInput").onchange=e=>handleReceipt(e.target.files[0]);
+  $("fileInput").onchange=e=>handleReceipt(e.target.files[0]);
   if(!editing)$("cancel").onclick=closeSheet;
   if(editing)$("delBtn").onclick=async()=>{
     await del("expenses",exp.id);toast("Deleted");render();
@@ -393,7 +559,7 @@ function openExpenseSheet(exp){
       date:$("eDate").value||todayISO(),
       category:$("eCat").value,
       note:$("eNote").value.trim(),
-      imageBlob:pendingBlob?pendingBlob:(editing?exp.imageBlob:null),
+      images:pendingImages?pendingImages:(editing&&exp.images?exp.images:[]),
       createdAt:editing?exp.createdAt:Date.now()
     };
     await put("expenses",rec);
@@ -510,21 +676,24 @@ async function generatePDF(folder,exps){
     doc.text(`${exps.length} receipt${exps.length!==1?"s":""} · generated ${new Date().toLocaleDateString()}`,M,fy+40);
     doc.setTextColor(20);
 
-    // ---- append receipt images ----
-    const withImg=exps.filter(e=>e.imageBlob)
+    // ---- append receipt images (one page per image; PDFs already rasterized) ----
+    const withImg=exps.map(normalize).filter(e=>e.images&&e.images.length)
       .sort((a,b)=>(a.category||"").localeCompare(b.category||"")||(a.date||"").localeCompare(b.date||""));
     for(const e of withImg){
-      doc.addPage();
-      doc.setFont("helvetica","bold");doc.setFontSize(11);
-      doc.text(`${e.merchant||"—"} — ${money(e.amount)}`,M,M);
-      doc.setFont("helvetica","normal");doc.setFontSize(9);doc.setTextColor(110);
-      doc.text(`${e.category||"Uncategorized"} · ${fmtDate(e.date)}${e.note?" · "+e.note:""}`,M,M+15);
-      doc.setTextColor(20);
-      const dataURL=await blobToDataURL(e.imageBlob);
-      const dims=await new Promise(r=>{const im=new Image();im.onload=()=>r({w:im.width,h:im.height});im.src=dataURL;});
-      const availW=PW-M*2, availH=PH-(M+30)-M;
-      let w=dims.w,h=dims.h;const s=Math.min(availW/w,availH/h);w*=s;h*=s;
-      doc.addImage(dataURL,"JPEG",(PW-w)/2,M+30,w,h,undefined,"FAST");
+      for(let idx=0;idx<e.images.length;idx++){
+        doc.addPage();
+        doc.setFont("helvetica","bold");doc.setFontSize(11);
+        const pg=e.images.length>1?`  (page ${idx+1}/${e.images.length})`:"";
+        doc.text(`${e.merchant||"—"} — ${money(e.amount)}${pg}`,M,M);
+        doc.setFont("helvetica","normal");doc.setFontSize(9);doc.setTextColor(110);
+        doc.text(`${e.category||"Uncategorized"} · ${fmtDate(e.date)}${e.note?" · "+e.note:""}`,M,M+15);
+        doc.setTextColor(20);
+        const dataURL=await blobToDataURL(e.images[idx]);
+        const dims=await new Promise(r=>{const im=new Image();im.onload=()=>r({w:im.width,h:im.height});im.src=dataURL;});
+        const availW=PW-M*2, availH=PH-(M+30)-M;
+        let w=dims.w,h=dims.h;const s=Math.min(availW/w,availH/h);w*=s;h*=s;
+        doc.addImage(dataURL,"JPEG",(PW-w)/2,M+30,w,h,undefined,"FAST");
+      }
     }
 
     // ---- deliver ----
