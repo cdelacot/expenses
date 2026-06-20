@@ -10,6 +10,7 @@
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="apple-touch-icon" href="apple-touch-icon.png">
 <title>Expenses</title>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js"></script>
 <style>
@@ -40,8 +41,17 @@
   .empty{text-align:center;color:var(--muted);margin-top:64px;padding:0 24px}
   .empty .big{font-size:2.4rem;margin-bottom:10px}
   .empty p{font-size:.95rem;margin:.3rem 0}
+  .loading{text-align:center;color:var(--muted);margin-top:60px;font-size:.92rem}
 
-  /* perforated-edge signature on cards */
+  /* login */
+  .login-wrap{max-width:380px;margin:8vh auto 0;padding:0 22px}
+  .login-logo{width:64px;height:64px;border-radius:16px;display:block;margin:0 auto 18px}
+  .login-wrap h1{text-align:center;font-size:1.4rem;letter-spacing:-.02em;margin:0 0 4px}
+  .login-wrap .tag{text-align:center;color:var(--muted);font-size:.9rem;margin-bottom:26px}
+  .login-card{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:20px}
+  .login-err{background:#FBEAE8;color:var(--danger);border-radius:9px;padding:10px 12px;
+    font-size:.86rem;margin-bottom:14px;display:none}
+
   .card{position:relative;background:var(--surface);border:1px solid var(--line);
     border-radius:12px;padding:16px 16px;margin-bottom:12px;overflow:hidden}
   .card::before{content:"";position:absolute;left:0;top:0;bottom:0;width:4px;
@@ -56,12 +66,10 @@
     padding:2px 8px;border-radius:999px;font-weight:600;letter-spacing:.01em}
   .has-photo{color:var(--accent)}
 
-  /* sticky action area at bottom */
   .dock{position:fixed;left:0;right:0;bottom:0;z-index:15;background:var(--surface);
     border-top:1px solid var(--line);padding:12px 18px calc(12px + var(--safe-bot))}
   .total{display:flex;align-items:baseline;justify-content:space-between;
-    margin-bottom:10px;padding-bottom:10px;
-    border-bottom:1px dashed var(--line)}
+    margin-bottom:10px;padding-bottom:10px;border-bottom:1px dashed var(--line)}
   .total .lab{font-size:.78rem;text-transform:uppercase;letter-spacing:.07em;color:var(--muted)}
   .total .val{font-family:var(--mono);font-size:1.5rem;font-weight:700;font-variant-numeric:tabular-nums}
   .dockbtns{display:flex;gap:10px}
@@ -75,7 +83,6 @@
     font-size:1.9rem;line-height:1;display:flex;align-items:center;justify-content:center;
     box-shadow:0 6px 18px rgba(14,124,102,.35)}
 
-  /* modal sheet */
   .scrim{position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:30;display:none}
   .scrim.open{display:block}
   .sheet{position:fixed;left:0;right:0;bottom:0;z-index:31;background:var(--surface);
@@ -107,15 +114,18 @@
   .add-cat input{flex:1}
   .add-cat button{background:var(--accent);color:#fff;border-radius:10px;padding:0 16px;font-weight:600}
   .hint{font-size:.8rem;color:var(--muted);margin-top:-6px;margin-bottom:14px}
+  .signout{width:100%;text-align:center;color:var(--danger);font-weight:600;padding:12px;margin-top:6px}
   .toast{position:fixed;left:50%;bottom:calc(170px + var(--safe-bot));transform:translateX(-50%);
     background:var(--ink);color:#fff;padding:11px 18px;border-radius:999px;font-size:.88rem;
     z-index:40;opacity:0;transition:opacity .2s;pointer-events:none;max-width:90vw;text-align:center}
   .toast.show{opacity:1}
   .swipe-hint{font-size:.74rem;color:var(--muted);text-align:center;margin-top:18px}
+  .folder-tools{display:flex;justify-content:flex-end;margin-top:8px}
+  .folder-tools button{color:var(--danger);font-size:.82rem;font-weight:600;padding:6px 4px}
 </style>
 </head>
 <body>
-<header>
+<header id="hdr" style="display:none">
   <div class="bar">
     <button class="back" id="backBtn" style="display:none" aria-label="Back">‹</button>
     <h1 id="title">Expenses</h1>
@@ -143,335 +153,278 @@
 <script>
 "use strict";
 
-/* ---------- IndexedDB ---------- */
-const DB_NAME="expenses-db", DB_VER=1;
-let db;
-function openDB(){
-  return new Promise((res,rej)=>{
-    const r=indexedDB.open(DB_NAME,DB_VER);
-    r.onupgradeneeded=e=>{
-      const d=e.target.result;
-      if(!d.objectStoreNames.contains("folders")){
-        d.createObjectStore("folders",{keyPath:"id"});
-      }
-      if(!d.objectStoreNames.contains("expenses")){
-        const s=d.createObjectStore("expenses",{keyPath:"id"});
-        s.createIndex("byFolder","folderId",{unique:false});
-      }
-      if(!d.objectStoreNames.contains("meta")){
-        d.createObjectStore("meta",{keyPath:"key"});
-      }
-    };
-    r.onsuccess=e=>{db=e.target.result;res(db);};
-    r.onerror=e=>rej(e.target.error);
-  });
-}
-function tx(store,mode){return db.transaction(store,mode).objectStore(store);}
-function put(store,val){return new Promise((res,rej)=>{const r=tx(store,"readwrite").put(val);r.onsuccess=()=>res(val);r.onerror=()=>rej(r.error);});}
-function del(store,key){return new Promise((res,rej)=>{const r=tx(store,"readwrite").delete(key);r.onsuccess=()=>res();r.onerror=()=>rej(r.error);});}
-function getAll(store){return new Promise((res,rej)=>{const r=tx(store,"readonly").getAll();r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error);});}
-function getOne(store,key){return new Promise((res,rej)=>{const r=tx(store,"readonly").get(key);r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error);});}
-function getByFolder(fid){return new Promise((res,rej)=>{const r=tx("expenses","readonly").index("byFolder").getAll(fid);r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error);});}
+/* ===== Supabase config (publishable key is safe to ship in client code) ===== */
+const SUPABASE_URL="https://weerkzrvpbcmgxlgufac.supabase.co";
+const SUPABASE_KEY="sb_publishable_X5EyQxmj4YIB1GHXnd0NBw_xBxL84R4";
+const sb=supabase.createClient(SUPABASE_URL,SUPABASE_KEY);
+const BUCKET="receipts";
 
-/* ---------- Settings ---------- */
-const DEFAULT_SETTINGS={
-  key:"settings",
-  email:"",
-  currency:"$",
-  categories:["Airfare","Lodging","Ground Transport","Meals","Conference / Registration","Supplies","Mileage","Other"]
-};
+const $=id=>document.getElementById(id);
+let session=null, userId=null;
+
+/* ===== settings (per device, in localStorage) ===== */
+const DEFAULT_SETTINGS={email:"",currency:"$",
+  categories:["Airfare","Lodging","Ground Transport","Meals","Conference / Registration","Supplies","Mileage","Other"]};
 let settings=null;
-async function loadSettings(){
-  settings=await getOne("meta","settings");
-  if(!settings){settings={...DEFAULT_SETTINGS};await put("meta",settings);}
+function loadSettings(){
+  try{settings=JSON.parse(localStorage.getItem("exp_settings"));}catch(e){}
+  if(!settings)settings={...DEFAULT_SETTINGS};
   if(!settings.categories||!settings.categories.length)settings.categories=[...DEFAULT_SETTINGS.categories];
   if(!settings.currency)settings.currency="$";
 }
-function saveSettings(){return put("meta",settings);}
+function saveSettings(){localStorage.setItem("exp_settings",JSON.stringify(settings));}
 
-/* ---------- helpers ---------- */
-const uid=()=>Date.now().toString(36)+Math.random().toString(36).slice(2,7);
+/* ===== helpers ===== */
 const money=n=>settings.currency+Number(n||0).toFixed(2);
-const todayISO=()=>{const d=new Date();return d.toISOString().slice(0,10);};
+const todayISO=()=>new Date().toISOString().slice(0,10);
 function fmtDate(iso){if(!iso)return"";const[y,m,d]=iso.split("-");return`${+m}/${+d}/${y.slice(2)}`;}
 function escapeHtml(s){return String(s||"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
 let toastT;
-function toast(msg){const t=document.getElementById("toast");t.textContent=msg;t.classList.add("show");clearTimeout(toastT);toastT=setTimeout(()=>t.classList.remove("show"),2600);}
+function toast(msg){const t=$("toast");t.textContent=msg;t.classList.add("show");clearTimeout(toastT);toastT=setTimeout(()=>t.classList.remove("show"),2800);}
+const blobToDataURL=b=>new Promise(r=>{const fr=new FileReader();fr.onload=()=>r(fr.result);fr.readAsDataURL(b);});
 
-/* downscale a captured image to keep storage + PDF lean */
+/* ===== image / PDF prep (still client-side, before upload) ===== */
 function processImage(file){
   return new Promise((res,rej)=>{
-    const img=new Image();
-    const url=URL.createObjectURL(file);
+    const img=new Image();const url=URL.createObjectURL(file);
     img.onload=()=>{
-      const MAX=1500;
-      let{width:w,height:h}=img;
+      const MAX=1500;let{width:w,height:h}=img;
       if(Math.max(w,h)>MAX){const s=MAX/Math.max(w,h);w=Math.round(w*s);h=Math.round(h*s);}
       const c=document.createElement("canvas");c.width=w;c.height=h;
-      c.getContext("2d").drawImage(img,0,0,w,h);
-      URL.revokeObjectURL(url);
+      c.getContext("2d").drawImage(img,0,0,w,h);URL.revokeObjectURL(url);
       c.toBlob(b=>res(b),"image/jpeg",0.82);
     };
-    img.onerror=()=>{URL.revokeObjectURL(url);rej(new Error("Could not read image"));};
+    img.onerror=()=>{URL.revokeObjectURL(url);rej(new Error("bad image"));};
     img.src=url;
   });
 }
-const blobToDataURL=b=>new Promise(r=>{const fr=new FileReader();fr.onload=()=>r(fr.result);fr.readAsDataURL(b);});
-
-/* ---------- receipt reading (PDF + OCR + parse) ---------- */
-const _loaded={};
-function ensureScript(src){
-  if(_loaded[src])return _loaded[src];
-  _loaded[src]=new Promise((res,rej)=>{
-    const s=document.createElement("script");s.src=src;
-    s.onload=()=>res();s.onerror=()=>rej(new Error("load failed: "+src));
-    document.head.appendChild(s);
-  });
-  return _loaded[src];
-}
-const PDFJS_SRC="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js";
-const PDFJS_WORKER="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
-const TESS_SRC="https://cdnjs.cloudflare.com/ajax/libs/tesseract.js/5.1.1/tesseract.min.js";
-
-async function ensurePdfjs(){
-  await ensureScript(PDFJS_SRC);
-  window.pdfjsLib.GlobalWorkerOptions.workerSrc=PDFJS_WORKER;
-  return window.pdfjsLib;
-}
-async function ensureTesseract(){await ensureScript(TESS_SRC);return window.Tesseract;}
-
 const canvasToBlob=(c,q=0.82)=>new Promise(r=>c.toBlob(b=>r(b),"image/jpeg",q));
-
-/* render a PDF (up to 5 pages) to JPEG blobs; first page kept large for OCR */
+let _pdfjs=null;
+async function ensurePdfjs(){
+  if(_pdfjs)return _pdfjs;
+  await new Promise((res,rej)=>{const s=document.createElement("script");
+    s.src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js";
+    s.onload=res;s.onerror=rej;document.head.appendChild(s);});
+  window.pdfjsLib.GlobalWorkerOptions.workerSrc="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+  return _pdfjs=window.pdfjsLib;
+}
 async function pdfToImages(file){
   const lib=await ensurePdfjs();
-  const buf=await file.arrayBuffer();
-  const pdf=await lib.getDocument({data:buf}).promise;
-  const out=[];let firstDataURL=null;
-  const n=Math.min(pdf.numPages,5);
+  const pdf=await lib.getDocument({data:await file.arrayBuffer()}).promise;
+  const out=[];let first=null;const n=Math.min(pdf.numPages,5);
   for(let i=1;i<=n;i++){
-    const page=await pdf.getPage(i);
-    let vp=page.getViewport({scale:1});
-    const target=i===1?2000:1500;                 // bigger first page = better OCR
-    const scale=Math.min(target/Math.max(vp.width,vp.height),3);
+    const page=await pdf.getPage(i);let vp=page.getViewport({scale:1});
+    const scale=Math.min((i===1?2000:1500)/Math.max(vp.width,vp.height),3);
     vp=page.getViewport({scale});
     const c=document.createElement("canvas");c.width=vp.width;c.height=vp.height;
     const ctx=c.getContext("2d");ctx.fillStyle="#fff";ctx.fillRect(0,0,c.width,c.height);
     await page.render({canvasContext:ctx,viewport:vp}).promise;
-    if(i===1)firstDataURL=c.toDataURL("image/jpeg",0.9);
+    if(i===1)first=c.toDataURL("image/jpeg",0.9);
     out.push(await canvasToBlob(c,i===1?0.85:0.8));
   }
-  return {images:out,ocrSource:firstDataURL};
+  return {images:out,ocrSource:first};
 }
-
-/* downscale an image file to a JPEG blob, and return a dataURL for OCR */
-async function imageToReceipt(file){
-  const blob=await processImage(file);
-  const dataURL=await blobToDataURL(blob);
-  return {images:[blob],ocrSource:dataURL};
-}
-
-async function ocrText(dataURL,onProgress){
-  const T=await ensureTesseract();
-  const res=await T.recognize(dataURL,"eng",{
-    logger:m=>{if(m.status==="recognizing text"&&onProgress)onProgress(m.progress);}
-  });
-  return res.data.text||"";
-}
-
-/* heuristics: pull merchant / amount / date / category from OCR text */
-function parseReceiptText(text){
-  const lines=text.split(/\r?\n/).map(l=>l.trim()).filter(Boolean);
-  const low=text.toLowerCase();
-  const out={merchant:null,amount:null,date:null,category:null};
-
-  // amount: prefer numbers on total-like lines, else the largest 2-decimal number
-  const numRe=/(\d{1,3}(?:,\d{3})*|\d+)\.(\d{2})\b/g;
-  const cand=[];
-  lines.forEach(l=>{
-    const ll=l.toLowerCase();
-    const weight=/(grand\s*total|amount\s*due|balance\s*due|total\s*due|^total\b|\btotal\b|amount\s*paid|charged)/.test(ll)
-      ?(/(grand\s*total|amount\s*due|balance\s*due|total\s*due)/.test(ll)?3:2):1;
-    if(/subtotal|sub\s*total|tax|tip|gratuity|change|cash|qty|item/.test(ll)&&weight<2)return;
-    let m;numRe.lastIndex=0;
-    while((m=numRe.exec(l))){const v=parseFloat(m[0].replace(/,/g,""));if(v>0&&v<100000)cand.push({v,weight});}
-  });
-  if(cand.length){
-    const maxW=Math.max(...cand.map(c=>c.weight));
-    const pool=cand.filter(c=>c.weight===maxW);
-    out.amount=Math.max(...pool.map(c=>c.v));
-  }
-
-  // date
-  const months={jan:1,feb:2,mar:3,apr:4,may:5,jun:6,jul:7,aug:8,sep:9,oct:10,nov:11,dec:12};
-  const iso=v=>{const d=String(v.d).padStart(2,"0"),mo=String(v.m).padStart(2,"0");return `${v.y}-${mo}-${d}`;};
-  let dm;
-  if((dm=text.match(/\b(20\d{2})[\/\-.](\d{1,2})[\/\-.](\d{1,2})\b/))){
-    out.date=iso({y:+dm[1],m:+dm[2],d:+dm[3]});
-  }else if((dm=text.match(/\b(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})\b/))){
-    let y=+dm[3];if(y<100)y+=2000;let mo=+dm[1],d=+dm[2];if(mo>12&&d<=12){[mo,d]=[d,mo];}
-    if(mo>=1&&mo<=12&&d>=1&&d<=31)out.date=iso({y,m:mo,d});
-  }else if((dm=text.match(/\b([A-Za-z]{3,9})\.?\s+(\d{1,2}),?\s+(20\d{2})\b/))){
-    const mo=months[dm[1].slice(0,3).toLowerCase()];if(mo)out.date=iso({y:+dm[3],m:mo,d:+dm[2]});
-  }
-
-  // merchant: first "name-like" line near the top
-  for(const l of lines.slice(0,6)){
-    const letters=(l.match(/[A-Za-z]/g)||[]).length;
-    if(letters>=3 && !/^\d/.test(l) && !/(receipt|invoice|order|tax|tel|phone|www\.|http|@|\d{3}[-.\s]\d{3})/i.test(l)
-       && l.length<=40){ out.merchant=l.replace(/\s{2,}/g," ").trim(); break; }
-  }
-
-  // category guess from keywords (only if it matches an existing category)
-  const map=[
-    [/hotel|inn|suites|lodg|marriott|hilton|hyatt|airbnb|resort/,"Lodging"],
-    [/uber|lyft|taxi|cab|parking|toll|transit|metro|rail|train|rental|hertz|avis|enterprise|gas|fuel|shell|exxon/,"Ground Transport"],
-    [/air|airline|airways|united|delta|american|jetblue|southwest|flight|baggage/,"Airfare"],
-    [/restaurant|cafe|coffee|grill|kitchen|bar|bistro|diner|pizza|sushi|starbucks|dunkin|food|deli/,"Meals"],
-    [/conference|registration|summit|expo|symposium|workshop|admission/,"Conference / Registration"],
-    [/office|staples|supply|supplies|amazon|fedex|ups|print|hardware/,"Supplies"]
-  ];
-  for(const [re,cat] of map){
-    if(re.test(low)&&settings.categories.includes(cat)){out.category=cat;break;}
-  }
-  return out;
-}
-
-/* full pipeline: file -> {images, fields} */
-async function extractReceipt(file,onProgress){
+async function prepReceipt(file){
   const isPdf=file.type==="application/pdf"||/\.pdf$/i.test(file.name);
-  const {images,ocrSource}= isPdf ? await pdfToImages(file) : await imageToReceipt(file);
-  let fields={};
-  if(ocrSource){
-    try{ fields=parseReceiptText(await ocrText(ocrSource,onProgress)); }
-    catch(e){ console.warn("OCR failed",e); }
-  }
-  return {images,fields};
+  if(isPdf)return pdfToImages(file);
+  const blob=await processImage(file);
+  return {images:[blob],ocrSource:await blobToDataURL(blob)};
 }
 
-/* normalize legacy records (single imageBlob -> images[]) */
-function normalize(e){if(e&&!Array.isArray(e.images))e.images=e.imageBlob?[e.imageBlob]:[];return e;}
+/* ===== AI extraction via Edge Function ===== */
+async function aiExtract(dataURL){
+  const {data,error}=await sb.functions.invoke("extract-receipt",{body:{image:dataURL,categories:settings.categories}});
+  if(error)throw error;
+  if(data&&data.error)throw new Error(data.error);
+  return data||{};
+}
 
-/* ---------- state + routing ---------- */
+/* ===== data layer (Supabase) ===== */
+async function listFolders(){
+  const {data,error}=await sb.from("folders").select("*").order("created_at",{ascending:false});
+  if(error)throw error;return data;
+}
+async function folderSums(){
+  const {data,error}=await sb.from("expenses").select("folder_id,amount");
+  if(error)throw error;
+  const m={};data.forEach(e=>{const t=m[e.folder_id]||(m[e.folder_id]={c:0,s:0});t.c++;t.s+=Number(e.amount||0);});
+  return m;
+}
+async function listExpenses(fid){
+  const {data,error}=await sb.from("expenses").select("*").eq("folder_id",fid);
+  if(error)throw error;
+  return data.sort((a,b)=>(a.date||"").localeCompare(b.date||"")||(a.created_at||"").localeCompare(b.created_at||""));
+}
+async function createFolder(name){
+  const {error}=await sb.from("folders").insert({name});if(error)throw error;
+}
+async function deleteFolder(fid){
+  const exps=await listExpenses(fid);
+  const paths=exps.flatMap(e=>e.receipt_paths||[]);
+  if(paths.length)await sb.storage.from(BUCKET).remove(paths);
+  const {error}=await sb.from("folders").delete().eq("id",fid);if(error)throw error;
+}
+async function uploadReceipts(expId,blobs){
+  const paths=[];
+  for(let i=0;i<blobs.length;i++){
+    const path=`${userId}/${expId}/${i}.jpg`;
+    const {error}=await sb.storage.from(BUCKET).upload(path,blobs[i],{contentType:"image/jpeg",upsert:true});
+    if(error)throw error;paths.push(path);
+  }
+  return paths;
+}
+async function saveExpense(rec,pendingImages,existing){
+  const id=existing?existing.id:(crypto.randomUUID?crypto.randomUUID():String(Date.now()));
+  let paths=existing?(existing.receipt_paths||[]):[];
+  if(pendingImages){
+    if(paths.length)await sb.storage.from(BUCKET).remove(paths);
+    paths=await uploadReceipts(id,pendingImages);
+  }
+  const row={id,folder_id:currentFolderId,merchant:rec.merchant,amount:rec.amount,
+    date:rec.date,category:rec.category,note:rec.note,receipt_paths:paths};
+  const {error}=await sb.from("expenses").upsert(row);if(error)throw error;
+}
+async function deleteExpense(e){
+  if(e.receipt_paths&&e.receipt_paths.length)await sb.storage.from(BUCKET).remove(e.receipt_paths);
+  const {error}=await sb.from("expenses").delete().eq("id",e.id);if(error)throw error;
+}
+async function downloadReceipt(path){
+  const {data,error}=await sb.storage.from(BUCKET).download(path);if(error)throw error;return data;
+}
+
+/* ===== routing ===== */
 let view="folders", currentFolderId=null;
-const $=id=>document.getElementById(id);
-
-async function render(){
-  closeSheet();
-  if(view==="folders")await renderFolders();
-  else if(view==="folder")await renderFolder();
+function route(){
+  if(!session){renderLogin();return;}
+  if(view==="folder"&&currentFolderId)renderFolder();
+  else renderFolders();
 }
 
-/* ---- folders list ---- */
-async function renderFolders(){
-  $("backBtn").style.display="none";
-  $("gearBtn").style.display="";
-  $("title").textContent="Expenses";
-  $("subtitle").textContent="";
-  $("dock").style.display="none";
-  $("fab").style.display="flex";
-  $("fab").onclick=openFolderSheet;
-
-  const folders=(await getAll("folders")).sort((a,b)=>b.createdAt-a.createdAt);
-  const main=$("main");
-  if(!folders.length){
-    main.innerHTML=`<div class="empty"><div class="big">📁</div>
-      <p><strong>No expense folders yet.</strong></p>
-      <p>Tap + to start one — a trip, a week, a project. Then snap receipts into it as you go.</p></div>`;
-    return;
-  }
-  let totals={};
-  for(const f of folders){
-    const exps=await getByFolder(f.id);
-    totals[f.id]={count:exps.length,sum:exps.reduce((a,e)=>a+Number(e.amount||0),0)};
-  }
-  main.innerHTML=folders.map(f=>{
-    const t=totals[f.id];
-    return `<div class="card" data-folder="${f.id}">
-      <div class="row1"><span class="name">${escapeHtml(f.name)}</span>
-      <span class="amt">${money(t.sum)}</span></div>
-      <div class="meta"><span>${t.count} item${t.count!==1?"s":""}</span>
-      <span>·</span><span>${new Date(f.createdAt).toLocaleDateString()}</span></div>
+/* ---- login ---- */
+function renderLogin(){
+  $("hdr").style.display="none";$("dock").style.display="none";$("fab").style.display="none";
+  closeSheet();
+  $("main").innerHTML=`
+    <div class="login-wrap">
+      <img class="login-logo" src="icon-192.png" alt="">
+      <h1>Expenses</h1>
+      <div class="tag">Sign in to your receipts</div>
+      <div class="login-card">
+        <div class="login-err" id="loginErr"></div>
+        <div class="field"><label>Email</label>
+          <input id="liEmail" type="email" inputmode="email" autocomplete="username" placeholder="you@company.com"></div>
+        <div class="field"><label>Password</label>
+          <input id="liPass" type="password" autocomplete="current-password" placeholder="••••••••"></div>
+        <button class="btn btn-primary" id="liBtn" style="width:100%">Log in</button>
+      </div>
     </div>`;
+  const doLogin=async()=>{
+    const email=$("liEmail").value.trim(),password=$("liPass").value;
+    if(!email||!password)return;
+    $("liBtn").textContent="Logging in…";$("liBtn").disabled=true;
+    const {error}=await sb.auth.signInWithPassword({email,password});
+    if(error){const e=$("loginErr");e.textContent=error.message||"Could not log in";e.style.display="block";
+      $("liBtn").textContent="Log in";$("liBtn").disabled=false;}
+    // success -> onAuthStateChange routes us in
+  };
+  $("liBtn").onclick=doLogin;
+  $("liPass").addEventListener("keydown",e=>{if(e.key==="Enter")doLogin();});
+}
+
+/* ---- folders ---- */
+async function renderFolders(){
+  closeSheet();
+  $("hdr").style.display="";$("backBtn").style.display="none";$("gearBtn").style.display="";
+  $("title").textContent="Expenses";$("subtitle").textContent="";
+  $("dock").style.display="none";$("fab").style.display="flex";$("fab").onclick=openFolderSheet;
+  $("main").innerHTML=`<div class="loading">Loading…</div>`;
+  let folders,sums;
+  try{folders=await listFolders();sums=await folderSums();}
+  catch(e){$("main").innerHTML=`<div class="empty"><p>Couldn’t load your folders.</p><p class="hint">${escapeHtml(e.message||e)}</p></div>`;return;}
+  if(!folders.length){
+    $("main").innerHTML=`<div class="empty"><div class="big">📁</div>
+      <p><strong>No expense folders yet.</strong></p>
+      <p>Tap + to start one — a trip, a week, a project. Add receipts from any device.</p></div>`;return;
+  }
+  $("main").innerHTML=folders.map(f=>{
+    const t=sums[f.id]||{c:0,s:0};
+    return `<div class="card" data-folder="${f.id}">
+      <div class="row1"><span class="name">${escapeHtml(f.name)}</span><span class="amt">${money(t.s)}</span></div>
+      <div class="meta"><span>${t.c} item${t.c!==1?"s":""}</span><span>·</span>
+      <span>${new Date(f.created_at).toLocaleDateString()}</span></div></div>`;
   }).join("");
-  main.querySelectorAll("[data-folder]").forEach(el=>{
-    el.onclick=()=>{currentFolderId=el.dataset.folder;view="folder";render();};
-  });
+  $("main").querySelectorAll("[data-folder]").forEach(el=>el.onclick=()=>{
+    currentFolderId=el.dataset.folder;view="folder";renderFolder();});
 }
 
 /* ---- single folder ---- */
 async function renderFolder(){
-  const folder=await getOne("folders",currentFolderId);
-  if(!folder){view="folders";return render();}
-  $("backBtn").style.display="";
-  $("backBtn").onclick=()=>{view="folders";currentFolderId=null;render();};
-  $("gearBtn").style.display="none";
-  $("title").textContent=folder.name;
-  $("fab").style.display="none";
+  closeSheet();
+  $("hdr").style.display="";$("backBtn").style.display="";
+  $("backBtn").onclick=()=>{view="folders";currentFolderId=null;renderFolders();};
+  $("gearBtn").style.display="none";$("fab").style.display="none";
+  $("main").innerHTML=`<div class="loading">Loading…</div>`;
 
-  const exps=(await getByFolder(currentFolderId)).map(normalize)
-    .sort((a,b)=>(a.date||"").localeCompare(b.date||"")||a.createdAt-b.createdAt);
+  let folder,exps;
+  try{
+    const fr=await sb.from("folders").select("*").eq("id",currentFolderId).single();
+    if(fr.error)throw fr.error;folder=fr.data;
+    exps=await listExpenses(currentFolderId);
+  }catch(e){view="folders";return renderFolders();}
+
+  $("title").textContent=folder.name;
   const sum=exps.reduce((a,e)=>a+Number(e.amount||0),0);
   $("subtitle").textContent=exps.length?`${exps.length} item${exps.length!==1?"s":""}`:"Empty — add your first receipt";
-  $("dock").style.display="";
-  $("totalVal").textContent=money(sum);
+  $("dock").style.display="";$("totalVal").textContent=money(sum);
   $("addExpenseBtn").onclick=()=>openExpenseSheet(null);
-  const genBtn=$("genBtn");
-  genBtn.disabled=exps.length===0;
-  genBtn.onclick=()=>generatePDF(folder,exps);
+  const gen=$("genBtn");gen.disabled=exps.length===0;gen.onclick=()=>generatePDF(folder,exps);
 
-  const main=$("main");
   if(!exps.length){
-    main.innerHTML=`<div class="empty"><div class="big">🧾</div>
+    $("main").innerHTML=`<div class="empty"><div class="big">🧾</div>
       <p><strong>No receipts in this folder.</strong></p>
-      <p>Tap “Add expense” below, then snap or upload the receipt — it auto-fills the fields.</p></div>`;
-    return;
+      <p>Tap “Add expense” below, then snap or upload the receipt — Claude auto-fills the fields.</p></div>
+      <div class="folder-tools"><button id="delFolder">Delete folder</button></div>`;
+  }else{
+    $("main").innerHTML=exps.map(e=>`
+      <div class="card" data-exp="${e.id}">
+        <div class="row1"><span class="name">${escapeHtml(e.merchant||"—")}</span><span class="amt">${money(e.amount)}</span></div>
+        <div class="meta"><span class="chip">${escapeHtml(e.category||"Uncategorized")}</span>
+          <span>${fmtDate(e.date)}</span>
+          ${e.receipt_paths&&e.receipt_paths.length?`<span class="has-photo">🧾 ${e.receipt_paths.length>1?e.receipt_paths.length+" pages":"receipt"}</span>`:'<span>no receipt</span>'}
+        </div></div>`).join("")+
+      `<div class="swipe-hint">Tap any item to edit or delete it.</div>
+       <div class="folder-tools"><button id="delFolder">Delete folder</button></div>`;
+    $("main").querySelectorAll("[data-exp]").forEach(el=>el.onclick=()=>{
+      const e=exps.find(x=>x.id===el.dataset.exp);openExpenseSheet(e);});
   }
-  main.innerHTML=exps.map(e=>`
-    <div class="card" data-exp="${e.id}">
-      <div class="row1"><span class="name">${escapeHtml(e.merchant||"—")}</span>
-      <span class="amt">${money(e.amount)}</span></div>
-      <div class="meta">
-        <span class="chip">${escapeHtml(e.category||"Uncategorized")}</span>
-        <span>${fmtDate(e.date)}</span>
-        ${e.images&&e.images.length?`<span class="has-photo">🧾 ${e.images.length>1?e.images.length+" pages":"receipt"}</span>`:'<span>no receipt</span>'}
-      </div>
-    </div>`).join("")+
-    `<div class="swipe-hint">Tap any item to edit or delete it.</div>`;
-  main.querySelectorAll("[data-exp]").forEach(el=>{
-    el.onclick=async()=>{const e=await getOne("expenses",el.dataset.exp);openExpenseSheet(e);};
-  });
+  $("delFolder").onclick=async()=>{
+    if(!confirm("Delete this folder and all its receipts? This can’t be undone."))return;
+    try{await deleteFolder(currentFolderId);toast("Folder deleted");view="folders";currentFolderId=null;renderFolders();}
+    catch(e){toast("Couldn’t delete folder");}
+  };
 }
 
-/* ---------- sheets ---------- */
-function openSheet(html){
-  const s=$("sheet");s.innerHTML=html;
-  $("scrim").classList.add("open");
-  requestAnimationFrame(()=>s.classList.add("open"));
-}
+/* ===== sheets ===== */
+function openSheet(html){$("sheet").innerHTML=html;$("scrim").classList.add("open");
+  requestAnimationFrame(()=>$("sheet").classList.add("open"));}
 function closeSheet(){$("sheet").classList.remove("open");$("scrim").classList.remove("open");}
 $("scrim").onclick=closeSheet;
 
-/* new folder */
 function openFolderSheet(){
   openSheet(`<h2>New expense folder</h2>
     <div class="field"><label>Folder name</label>
     <input id="fName" placeholder="e.g. Boston site visit — Jun" autocomplete="off"></div>
-    <div class="sheetbtns">
-      <button class="btn btn-ghost" id="cancel">Cancel</button>
-      <button class="btn btn-primary" id="save">Create folder</button>
-    </div>`);
+    <div class="sheetbtns"><button class="btn btn-ghost" id="cancel">Cancel</button>
+    <button class="btn btn-primary" id="save">Create folder</button></div>`);
   setTimeout(()=>$("fName").focus(),250);
   $("cancel").onclick=closeSheet;
   $("save").onclick=async()=>{
-    const name=$("fName").value.trim();
-    if(!name)return toast("Give the folder a name");
-    await put("folders",{id:uid(),name,createdAt:Date.now()});
-    render();
+    const name=$("fName").value.trim();if(!name)return toast("Give the folder a name");
+    $("save").disabled=true;
+    try{await createFolder(name);renderFolders();}catch(e){toast("Couldn’t create folder");$("save").disabled=false;}
   };
 }
 
-/* add / edit expense */
 let pendingImages=null;
 function openExpenseSheet(exp){
   pendingImages=null;
@@ -481,7 +434,7 @@ function openExpenseSheet(exp){
   openSheet(`<h2>${editing?"Edit expense":"Add expense"}</h2>
     <div class="field"><label>Merchant</label>
       <input id="eMerch" placeholder="Where did you spend?" autocomplete="off" value="${editing?escapeHtml(exp.merchant):""}"></div>
-    <div class="field"><label>Amount (${settings.currency})</label>
+    <div class="field"><label>Amount (${escapeHtml(settings.currency)})</label>
       <input id="eAmt" inputmode="decimal" placeholder="0.00" value="${editing&&exp.amount!=null?exp.amount:""}"></div>
     <div class="field"><label>Date</label>
       <input id="eDate" type="date" value="${editing?exp.date:todayISO()}"></div>
@@ -489,7 +442,7 @@ function openExpenseSheet(exp){
       <select id="eCat">${cats.map(c=>`<option ${c===curCat?"selected":""}>${escapeHtml(c)}</option>`).join("")}</select></div>
     <div class="field"><label>Note (optional)</label>
       <input id="eNote" placeholder="Client, purpose…" autocomplete="off" value="${editing&&exp.note?escapeHtml(exp.note):""}"></div>
-    <div class="field"><label>Receipt — auto-fills the fields above</label>
+    <div class="field"><label>Receipt — Claude auto-fills the fields above</label>
       <div class="rcpt-btns">
         <button class="photo-btn half" id="camBtn">📷 Take photo</button>
         <button class="photo-btn half" id="fileBtn">📄 Upload PDF / image</button>
@@ -504,71 +457,62 @@ function openExpenseSheet(exp){
       <button class="btn btn-primary" id="save">${editing?"Save changes":"Add expense"}</button>
     </div>`);
 
-  // show existing image(s)
-  normalize(exp||{});
-  if(editing&&exp.images&&exp.images.length){
-    const p=$("photoPrev");p.src=URL.createObjectURL(exp.images[0]);p.style.display="block";
-    if(exp.images.length>1){$("rcptStatus").style.display="block";$("rcptStatus").textContent=`${exp.images.length} pages attached`;}
+  if(editing&&exp.receipt_paths&&exp.receipt_paths.length){
+    const st=$("rcptStatus");st.style.display="block";st.textContent="Loading receipt…";
+    downloadReceipt(exp.receipt_paths[0]).then(blob=>{
+      const p=$("photoPrev");p.src=URL.createObjectURL(blob);p.style.display="block";
+      st.textContent=exp.receipt_paths.length>1?`${exp.receipt_paths.length} pages attached`:"Receipt attached";
+    }).catch(()=>{st.textContent="Receipt attached";});
   }
-  // track manual edits so auto-fill never clobbers what you typed
   ["eMerch","eAmt","eDate","eCat"].forEach(id=>$(id).addEventListener("input",e=>e.target.dataset.touched="1"));
-  const setIfUntouched=(id,val)=>{const el=$(id);if(val!=null&&!el.dataset.touched)el.value=val;};
+  const setIfUntouched=(id,val)=>{const el=$(id);if(val!=null&&val!==""&&!el.dataset.touched)el.value=val;};
 
   async function handleReceipt(file){
     if(!file)return;
-    const status=$("rcptStatus");status.style.display="block";
-    status.textContent="Reading receipt…";
+    const st=$("rcptStatus");st.style.display="block";st.textContent="Preparing…";
     try{
-      const {images,fields}=await extractReceipt(file,p=>{
-        status.textContent=`Reading receipt… ${Math.round(p*100)}%`;
-      });
+      const {images,ocrSource}=await prepReceipt(file);
       pendingImages=images;
       const p=$("photoPrev");p.src=URL.createObjectURL(images[0]);p.style.display="block";
-      // auto-fill
-      setIfUntouched("eMerch",fields.merchant);
-      if(fields.amount!=null)setIfUntouched("eAmt",fields.amount.toFixed(2));
-      setIfUntouched("eDate",fields.date);
-      if(fields.category)setIfUntouched("eCat",fields.category);
-      const got=[fields.merchant&&"merchant",fields.amount!=null&&"amount",fields.date&&"date"].filter(Boolean);
-      const pages=images.length>1?` · ${images.length} pages`:"";
-      status.innerHTML=got.length
-        ? `✓ Filled ${got.join(", ")}${pages} — check it’s right`
-        : `Receipt attached${pages} — couldn’t auto-read, enter manually`;
       $("camBtn").classList.add("set");$("fileBtn").classList.add("set");
-    }catch(e){
-      console.error(e);
-      status.textContent="Couldn’t read that file — attach again or enter manually";
-    }
+      st.textContent="Reading receipt with Claude…";
+      try{
+        const f=await aiExtract(ocrSource);
+        setIfUntouched("eMerch",f.merchant);
+        if(f.amount!=null)setIfUntouched("eAmt",Number(f.amount).toFixed(2));
+        setIfUntouched("eDate",f.date);
+        if(f.category&&cats.includes(f.category))setIfUntouched("eCat",f.category);
+        const got=[f.merchant&&"merchant",f.amount!=null&&"amount",f.date&&"date"].filter(Boolean);
+        const pages=images.length>1?` · ${images.length} pages`:"";
+        st.textContent=got.length?`✓ Filled ${got.join(", ")}${pages} — check it’s right`:`Receipt attached${pages} — enter fields manually`;
+      }catch(err){
+        const pages=images.length>1?` · ${images.length} pages`:"";
+        st.textContent=`Receipt attached${pages} — couldn’t auto-read, enter manually`;
+      }
+    }catch(e){st.textContent="Couldn’t read that file — try again or enter manually";}
   }
   $("camBtn").onclick=()=>$("camInput").click();
   $("fileBtn").onclick=()=>$("fileInput").click();
   $("camInput").onchange=e=>handleReceipt(e.target.files[0]);
   $("fileInput").onchange=e=>handleReceipt(e.target.files[0]);
+
   if(!editing)$("cancel").onclick=closeSheet;
   if(editing)$("delBtn").onclick=async()=>{
-    await del("expenses",exp.id);toast("Deleted");render();
+    $("delBtn").disabled=true;
+    try{await deleteExpense(exp);toast("Deleted");renderFolder();}catch(e){toast("Couldn’t delete");$("delBtn").disabled=false;}
   };
   $("save").onclick=async()=>{
     const amt=parseFloat($("eAmt").value);
     if(isNaN(amt))return toast("Enter an amount");
-    const rec={
-      id:editing?exp.id:uid(),
-      folderId:currentFolderId,
-      merchant:$("eMerch").value.trim(),
-      amount:amt,
-      date:$("eDate").value||todayISO(),
-      category:$("eCat").value,
-      note:$("eNote").value.trim(),
-      images:pendingImages?pendingImages:(editing&&exp.images?exp.images:[]),
-      createdAt:editing?exp.createdAt:Date.now()
-    };
-    await put("expenses",rec);
-    toast(editing?"Saved":"Expense added");
-    render();
+    $("save").disabled=true;$("save").textContent="Saving…";
+    const rec={merchant:$("eMerch").value.trim(),amount:amt,date:$("eDate").value||todayISO(),
+      category:$("eCat").value,note:$("eNote").value.trim()};
+    try{await saveExpense(rec,pendingImages,editing?exp:null);toast(editing?"Saved":"Expense added");renderFolder();}
+    catch(e){toast("Couldn’t save — check connection");$("save").disabled=false;$("save").textContent=editing?"Save changes":"Add expense";}
   };
 }
 
-/* settings */
+/* ---- settings ---- */
 $("gearBtn").onclick=openSettings;
 function openSettings(){
   openSheet(`<h2>Settings</h2>
@@ -581,161 +525,108 @@ function openSettings(){
       <div class="cat-list" id="catList"></div>
       <div class="add-cat"><input id="newCat" placeholder="Add a category" autocomplete="off"><button id="addCat">Add</button></div>
     </div>
-    <div class="sheetbtns">
-      <button class="btn btn-ghost" id="cancel">Close</button>
-      <button class="btn btn-primary" id="save">Save</button>
-    </div>`);
-  const drawCats=()=>{
-    $("catList").innerHTML=settings.categories.map((c,i)=>
-      `<span class="cat-tag">${escapeHtml(c)}<button data-i="${i}" aria-label="Remove">✕</button></span>`).join("");
-    $("catList").querySelectorAll("button").forEach(b=>b.onclick=()=>{
-      settings.categories.splice(+b.dataset.i,1);drawCats();
-    });
+    <div class="sheetbtns"><button class="btn btn-ghost" id="cancel">Close</button>
+      <button class="btn btn-primary" id="save">Save</button></div>
+    <button class="signout" id="signout">Sign out</button>`);
+  const draw=()=>{
+    $("catList").innerHTML=settings.categories.map((c,i)=>`<span class="cat-tag">${escapeHtml(c)}<button data-i="${i}">✕</button></span>`).join("");
+    $("catList").querySelectorAll("button").forEach(b=>b.onclick=()=>{settings.categories.splice(+b.dataset.i,1);draw();});
   };
-  drawCats();
-  $("addCat").onclick=()=>{
-    const v=$("newCat").value.trim();
-    if(v&&!settings.categories.includes(v)){settings.categories.push(v);$("newCat").value="";drawCats();}
-  };
-  $("cancel").onclick=()=>{loadSettings().then(render);};
-  $("save").onclick=async()=>{
-    settings.email=$("sEmail").value.trim();
-    settings.currency=$("sCur").value.trim()||"$";
+  draw();
+  $("addCat").onclick=()=>{const v=$("newCat").value.trim();
+    if(v&&!settings.categories.includes(v)){settings.categories.push(v);$("newCat").value="";draw();}};
+  $("cancel").onclick=()=>{loadSettings();route();};
+  $("save").onclick=()=>{
+    settings.email=$("sEmail").value.trim();settings.currency=$("sCur").value.trim()||"$";
     if(!settings.categories.length)settings.categories=[...DEFAULT_SETTINGS.categories];
-    await saveSettings();toast("Settings saved");render();
+    saveSettings();toast("Settings saved");route();
   };
+  $("signout").onclick=async()=>{await sb.auth.signOut();};
 }
 
-/* ---------- PDF generation ---------- */
+/* ===== PDF generation (images pulled from storage) ===== */
 async function generatePDF(folder,exps){
-  const btn=$("genBtn");const orig=btn.textContent;
-  btn.disabled=true;btn.textContent="Building…";
+  const btn=$("genBtn");const orig=btn.textContent;btn.disabled=true;btn.textContent="Building…";
   try{
     const {jsPDF}=window.jspdf;
     const doc=new jsPDF({unit:"pt",format:"a4"});
-    const PW=doc.internal.pageSize.getWidth();
-    const PH=doc.internal.pageSize.getHeight();
-    const M=42;
-
-    // group by category
-    const byCat={};
-    exps.forEach(e=>{(byCat[e.category||"Uncategorized"]=byCat[e.category||"Uncategorized"]||[]).push(e);});
+    const PW=doc.internal.pageSize.getWidth(),PH=doc.internal.pageSize.getHeight(),M=42;
+    const byCat={};exps.forEach(e=>{(byCat[e.category||"Uncategorized"]=byCat[e.category||"Uncategorized"]||[]).push(e);});
     const cats=Object.keys(byCat).sort();
     const dates=exps.map(e=>e.date).filter(Boolean).sort();
     const range=dates.length?`${fmtDate(dates[0])} – ${fmtDate(dates[dates.length-1])}`:"";
     const grand=exps.reduce((a,e)=>a+Number(e.amount||0),0);
 
-    // ---- summary cover ----
-    doc.setFont("helvetica","bold");doc.setFontSize(20);
-    doc.text(folder.name,M,M+10);
+    doc.setFont("helvetica","bold");doc.setFontSize(20);doc.text(folder.name,M,M+10);
     doc.setFont("helvetica","normal");doc.setFontSize(10);doc.setTextColor(110);
-    let sy=M+30;
-    doc.text("Expense Report",M,sy);
-    if(range){doc.text(range,PW-M,sy,{align:"right"});}
+    let sy=M+30;doc.text("Expense Report",M,sy);
+    if(range)doc.text(range,PW-M,sy,{align:"right"});
     doc.setTextColor(20);
 
-    // build table rows with category headers + subtotals
-    const body=[];const meta=[];
+    const body=[],meta=[];
     cats.forEach(cat=>{
       const items=byCat[cat].slice().sort((a,b)=>(a.date||"").localeCompare(b.date||""));
       body.push([cat,"","",""]);meta.push("head");
-      items.forEach(e=>{
-        body.push([fmtDate(e.date),e.merchant||"—",e.note||"",money(e.amount)]);
-        meta.push("item");
-      });
+      items.forEach(e=>{body.push([fmtDate(e.date),e.merchant||"—",e.note||"",money(e.amount)]);meta.push("item");});
       const sub=items.reduce((a,e)=>a+Number(e.amount||0),0);
       body.push(["","","Subtotal",money(sub)]);meta.push("sub");
     });
-
-    doc.autoTable({
-      startY:sy+16,
-      head:[["Date","Merchant","Note","Amount"]],
-      body,
-      margin:{left:M,right:M},
+    doc.autoTable({startY:sy+16,head:[["Date","Merchant","Note","Amount"]],body,margin:{left:M,right:M},
       styles:{font:"helvetica",fontSize:9.5,cellPadding:5,textColor:30,lineColor:[231,228,220],lineWidth:.5},
       headStyles:{fillColor:[14,124,102],textColor:255,fontStyle:"bold"},
       columnStyles:{0:{cellWidth:62},3:{halign:"right",cellWidth:80,font:"courier"}},
-      didParseCell:d=>{
-        if(d.section!=="body")return;
-        const t=meta[d.row.index];
+      didParseCell:d=>{if(d.section!=="body")return;const t=meta[d.row.index];
         if(t==="head"){d.cell.styles.fillColor=[240,238,232];d.cell.styles.fontStyle="bold";d.cell.styles.textColor=[10,90,74];}
-        if(t==="sub"){d.cell.styles.fontStyle="bold";d.cell.styles.fillColor=[250,249,247];
-          if(d.column.index===3)d.cell.styles.font="courier";}
-      }
+        if(t==="sub"){d.cell.styles.fontStyle="bold";d.cell.styles.fillColor=[250,249,247];if(d.column.index===3)d.cell.styles.font="courier";}}
     });
-
-    let fy=doc.lastAutoTable.finalY+18;
-    if(fy>PH-70){doc.addPage();fy=M+10;}
-    doc.setDrawColor(14,124,102);doc.setLineWidth(1);
-    doc.line(M,fy,PW-M,fy);
-    doc.setFont("helvetica","bold");doc.setFontSize(13);
-    doc.text("Total",M,fy+22);
-    doc.setFont("courier","bold");
-    doc.text(money(grand),PW-M,fy+22,{align:"right"});
+    let fy=doc.lastAutoTable.finalY+18;if(fy>PH-70){doc.addPage();fy=M+10;}
+    doc.setDrawColor(14,124,102);doc.setLineWidth(1);doc.line(M,fy,PW-M,fy);
+    doc.setFont("helvetica","bold");doc.setFontSize(13);doc.text("Total",M,fy+22);
+    doc.setFont("courier","bold");doc.text(money(grand),PW-M,fy+22,{align:"right"});
     doc.setFont("helvetica","normal");doc.setFontSize(8);doc.setTextColor(150);
     doc.text(`${exps.length} receipt${exps.length!==1?"s":""} · generated ${new Date().toLocaleDateString()}`,M,fy+40);
     doc.setTextColor(20);
 
-    // ---- append receipt images (one page per image; PDFs already rasterized) ----
-    const withImg=exps.map(normalize).filter(e=>e.images&&e.images.length)
+    const withImg=exps.filter(e=>e.receipt_paths&&e.receipt_paths.length)
       .sort((a,b)=>(a.category||"").localeCompare(b.category||"")||(a.date||"").localeCompare(b.date||""));
     for(const e of withImg){
-      for(let idx=0;idx<e.images.length;idx++){
+      for(let idx=0;idx<e.receipt_paths.length;idx++){
+        let dataURL;
+        try{dataURL=await blobToDataURL(await downloadReceipt(e.receipt_paths[idx]));}catch(err){continue;}
         doc.addPage();
         doc.setFont("helvetica","bold");doc.setFontSize(11);
-        const pg=e.images.length>1?`  (page ${idx+1}/${e.images.length})`:"";
+        const pg=e.receipt_paths.length>1?`  (page ${idx+1}/${e.receipt_paths.length})`:"";
         doc.text(`${e.merchant||"—"} — ${money(e.amount)}${pg}`,M,M);
         doc.setFont("helvetica","normal");doc.setFontSize(9);doc.setTextColor(110);
         doc.text(`${e.category||"Uncategorized"} · ${fmtDate(e.date)}${e.note?" · "+e.note:""}`,M,M+15);
         doc.setTextColor(20);
-        const dataURL=await blobToDataURL(e.images[idx]);
         const dims=await new Promise(r=>{const im=new Image();im.onload=()=>r({w:im.width,h:im.height});im.src=dataURL;});
-        const availW=PW-M*2, availH=PH-(M+30)-M;
-        let w=dims.w,h=dims.h;const s=Math.min(availW/w,availH/h);w*=s;h*=s;
+        const availW=PW-M*2,availH=PH-(M+30)-M;let w=dims.w,h=dims.h;
+        const s=Math.min(availW/w,availH/h);w*=s;h*=s;
         doc.addImage(dataURL,"JPEG",(PW-w)/2,M+30,w,h,undefined,"FAST");
       }
     }
-
-    // ---- deliver ----
-    const safeName=folder.name.replace(/[^\w\-]+/g,"_").replace(/^_+|_+$/g,"")||"expenses";
-    const fileName=`Expenses_${safeName}.pdf`;
+    const safe=folder.name.replace(/[^\w\-]+/g,"_").replace(/^_+|_+$/g,"")||"expenses";
+    const fileName=`Expenses_${safe}.pdf`;
     const blob=doc.output("blob");
     const file=new File([blob],fileName,{type:"application/pdf"});
-
-    const shareText=settings.email
-      ? `Expense report: ${folder.name} — ${money(grand)}. Send to ${settings.email}.`
-      : `Expense report: ${folder.name} — ${money(grand)}.`;
-
+    const text=settings.email?`Expense report: ${folder.name} — ${money(grand)}. Send to ${settings.email}.`
+      :`Expense report: ${folder.name} — ${money(grand)}.`;
     if(navigator.canShare&&navigator.canShare({files:[file]})){
-      try{
-        await navigator.share({files:[file],title:fileName,text:shareText});
-      }catch(err){ if(err.name!=="AbortError") downloadBlob(blob,fileName); }
-    }else{
-      downloadBlob(blob,fileName);
-      toast("PDF saved — attach it to an email");
-    }
-  }catch(e){
-    console.error(e);toast("Something went wrong building the PDF");
-  }finally{
-    btn.textContent=orig;btn.disabled=false;
-  }
+      try{await navigator.share({files:[file],title:fileName,text});}
+      catch(err){if(err.name!=="AbortError")downloadBlob(blob,fileName);}
+    }else{downloadBlob(blob,fileName);toast("PDF saved — attach it to an email");}
+  }catch(e){console.error(e);toast("Something went wrong building the PDF");}
+  finally{btn.textContent=orig;btn.disabled=false;}
 }
-function downloadBlob(blob,name){
-  const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download=name;
-  document.body.appendChild(a);a.click();a.remove();
-  setTimeout(()=>URL.revokeObjectURL(a.href),4000);
-}
+function downloadBlob(blob,name){const a=document.createElement("a");a.href=URL.createObjectURL(blob);
+  a.download=name;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(a.href),4000);}
 
-/* ---------- boot ---------- */
-(async()=>{
-  await openDB();
-  await loadSettings();
-  if(navigator.storage&&navigator.storage.persist){try{await navigator.storage.persist();}catch(e){}}
-  render();
-  if("serviceWorker" in navigator){
-    window.addEventListener("load",()=>navigator.serviceWorker.register("sw.js").catch(()=>{}));
-  }
-})();
+/* ===== boot ===== */
+loadSettings();
+sb.auth.getSession().then(({data})=>{session=data.session;userId=session?session.user.id:null;route();});
+sb.auth.onAuthStateChange((_e,s)=>{session=s;userId=s?s.user.id:null;view="folders";currentFolderId=null;route();});
+if("serviceWorker" in navigator){window.addEventListener("load",()=>navigator.serviceWorker.register("sw.js").catch(()=>{}));}
 </script>
 </body>
 </html>
