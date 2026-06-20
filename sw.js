@@ -1,4 +1,4 @@
-const CACHE = "expenses-v3";
+const CACHE = "expenses-v4";
 const SHELL = ["./", "./index.html", "./manifest.webmanifest", "./icon-192.png", "./icon-512.png"];
 const CDN = ["cdnjs.cloudflare.com", "cdn.jsdelivr.net"];
 
@@ -21,15 +21,27 @@ self.addEventListener("fetch", e => {
   const sameOrigin = url.origin === self.location.origin;
   const isCdn = CDN.includes(url.hostname);
 
-  // Supabase (data, auth, storage, functions) and anything else: network-only, never cached.
+  // Supabase (data, auth, storage, functions) and everything else: network-only, never touched.
   if (!sameOrigin && !isCdn) return;
 
-  // App shell + CDN libraries: cache-first.
+  if (isCdn) {
+    // Versioned libraries are immutable — cache-first is safe and fast.
+    e.respondWith(
+      caches.match(e.request).then(hit => hit || fetch(e.request).then(res => {
+        const copy = res.clone();
+        caches.open(CACHE).then(c => c.put(e.request, copy)).catch(() => {});
+        return res;
+      }))
+    );
+    return;
+  }
+
+  // App shell (HTML, manifest, icons): network-FIRST so new deploys always win.
   e.respondWith(
-    caches.match(e.request).then(hit => hit || fetch(e.request).then(res => {
+    fetch(e.request).then(res => {
       const copy = res.clone();
       caches.open(CACHE).then(c => c.put(e.request, copy)).catch(() => {});
       return res;
-    }).catch(() => sameOrigin ? caches.match("./index.html") : undefined))
+    }).catch(() => caches.match(e.request).then(hit => hit || caches.match("./index.html")))
   );
 });
