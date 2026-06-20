@@ -234,8 +234,13 @@ async function prepReceipt(file){
 /* ===== AI extraction via Edge Function ===== */
 async function aiExtract(dataURL){
   const {data,error}=await sb.functions.invoke("extract-receipt",{body:{image:dataURL,categories:settings.categories}});
-  if(error)throw error;
-  if(data&&data.error)throw new Error(data.error);
+  if(error){
+    let detail="";
+    try{if(error.context&&typeof error.context.json==="function"){const b=await error.context.json();detail=b.detail||b.error||"";}}catch(_){}
+    if(!detail&&error.context&&typeof error.context.status==="number")detail="HTTP "+error.context.status;
+    throw new Error(detail||error.message||"Function call failed");
+  }
+  if(data&&data.error)throw new Error(data.detail?`${data.error} — ${data.detail}`:data.error);
   return data||{};
 }
 
@@ -487,7 +492,8 @@ function openExpenseSheet(exp){
         st.textContent=got.length?`✓ Filled ${got.join(", ")}${pages} — check it’s right`:`Receipt attached${pages} — enter fields manually`;
       }catch(err){
         const pages=images.length>1?` · ${images.length} pages`:"";
-        st.textContent=`Receipt attached${pages} — couldn’t auto-read, enter manually`;
+        const msg=(err&&err.message)?String(err.message).slice(0,160):"unknown error";
+        st.innerHTML=`Receipt attached${pages}. Auto-read failed: <span style="color:var(--danger)">${escapeHtml(msg)}</span>`;
       }
     }catch(e){st.textContent="Couldn’t read that file — try again or enter manually";}
   }
