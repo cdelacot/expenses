@@ -233,7 +233,7 @@ async function prepReceipt(file){
 
 /* ===== AI extraction via Edge Function ===== */
 async function aiExtract(dataURL){
-  const {data,error}=await sb.functions.invoke("extract-receipt",{body:{image:dataURL,categories:settings.categories}});
+  const {data,error}=await sb.functions.invoke("quick-worker",{body:{image:dataURL,categories:settings.categories}});
   if(error){
     let detail="";
     try{if(error.context&&typeof error.context.json==="function"){const b=await error.context.json();detail=b.detail||b.error||"";}}catch(_){}
